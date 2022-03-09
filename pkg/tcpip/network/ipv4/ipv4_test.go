@@ -2275,6 +2275,39 @@ func TestFragmentReassemblyTimeout(t *testing.T) {
 	}
 }
 
+type udpPortMatcher struct {
+	sourcePort      uint16
+	destinationPort uint16
+}
+
+// Match implements Matcher.Match.
+func (um *udpPortMatcher) Match(_ stack.Hook, pkt *stack.PacketBuffer, _, _ string) (bool, bool) {
+	udpHeader := header.UDP(pkt.TransportHeader().View())
+	if len(udpHeader) < header.UDPMinimumSize {
+		return false, true
+	}
+
+	netHdr := pkt.Network()
+	payloadChecksum := pkt.Data().AsRange().Checksum()
+	if !udpHeader.IsChecksumValid(netHdr.SourceAddress(), netHdr.DestinationAddress(), payloadChecksum) {
+		return false, true
+	}
+
+	if sourcePort := udpHeader.SourcePort(); sourcePort != um.sourcePort {
+		return false, true
+	}
+	if destinationPort := udpHeader.DestinationPort(); destinationPort != um.destinationPort {
+		return false, true
+	}
+
+	return true, false
+}
+
+// Name implements Matcher.Name.
+func (*udpPortMatcher) Name() string {
+	return "udpPortMatcher"
+}
+
 // TestReceiveFragments feeds fragments in through the incoming packet path to
 // test reassembly
 func TestReceiveFragments(t *testing.T) {
@@ -2284,6 +2317,9 @@ func TestReceiveFragments(t *testing.T) {
 		addr1 = tcpip.Address("\x0c\xa8\x00\x01") // 192.168.0.1
 		addr2 = tcpip.Address("\x0c\xa8\x00\x02") // 192.168.0.2
 		addr3 = tcpip.Address("\x0c\xa8\x00\x03") // 192.168.0.3
+
+		srcPort = 5555
+		dstPort = 80
 	)
 
 	// Build and return a UDP header containing payload.
@@ -2298,8 +2334,8 @@ func TestReceiveFragments(t *testing.T) {
 		hdr := buffer.NewPrependable(udpLength)
 		u := header.UDP(hdr.Prepend(udpLength))
 		u.Encode(&header.UDPFields{
-			SrcPort: 5555,
-			DstPort: 80,
+			SrcPort: srcPort,
+			DstPort: dstPort,
 			Length:  uint16(udpLength),
 		})
 		copy(u.Payload(), payload)
@@ -2669,6 +2705,20 @@ func TestReceiveFragments(t *testing.T) {
 			ctx := newTestContext()
 			defer ctx.cleanup()
 			s := ctx.s
+
+			// Add iptables rules on for Prerouting and Input, with a matcher that
+			// immediately drops packets if they are not valid UDP packets. This shows
+			// that reassembly is performed before these hooks are executed.
+			// Use the NAT iptable, which has rules for both Prerouting and Input.
+			ipt := s.IPTables()
+			filter := ipt.GetTable(stack.NATID, false)
+			ruleIdx := filter.BuiltinChains[stack.Prerouting]
+			matchers := [...]stack.Matcher{&udpPortMatcher{sourcePort: srcPort, destinationPort: dstPort}}
+			filter.Rules[ruleIdx].Target = &stack.AcceptTarget{}
+			filter.Rules[ruleIdx].Matchers = matchers[:]
+			filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
+			filter.Rules[ruleIdx+1].Matchers = matchers[:]
+			ipt.ReplaceTable(stack.NATID, filter, false)
 
 			e := channel.New(0, 1280, "\xf0\x00")
 			defer e.Close()

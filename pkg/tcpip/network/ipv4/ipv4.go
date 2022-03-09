@@ -774,7 +774,18 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 				return
 			}
 		}
+	}
 
+	var reassembled bool
+	pkt, h, reassembled = e.reassemble(pkt, h)
+	if pkt == nil {
+		return
+	}
+	if reassembled {
+		defer pkt.DecRef()
+	}
+
+	if !e.nic.IsLoopback() {
 		// Loopback traffic skips the prerouting chain.
 		inNicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
 		if ok := e.protocol.stack.IPTables().CheckPrerouting(pkt, e, inNicName); !ok {
@@ -785,6 +796,84 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 	}
 
 	e.handleValidatedPacket(h, pkt, e.nic.Name() /* inNICName */)
+}
+
+func (e *endpoint) reassemble(pkt *stack.PacketBuffer, h header.IPv4) (*stack.PacketBuffer, header.IPv4, bool) {
+	if !h.More() && h.FragmentOffset() == 0 {
+		return pkt, h, false
+	}
+
+	stats := e.stats.ip
+	if pkt.Data().Size()+pkt.TransportHeader().View().Size() == 0 {
+		// Drop the packet as it's marked as a fragment but has
+		// no payload.
+		stats.MalformedPacketsReceived.Increment()
+		stats.MalformedFragmentsReceived.Increment()
+		return nil, nil, false
+	}
+	if opts := h.Options(); len(opts) != 0 {
+		// If there are options we need to check them before we do assembly
+		// or we could be assembling errant packets. However we do not change the
+		// options as that could lead to double processing later.
+		if _, _, optProblem := e.processIPOptions(pkt, opts, &optionUsageVerify{}); optProblem != nil {
+			if optProblem.NeedICMP {
+				_ = e.protocol.returnError(&icmpReasonParamProblem{
+					pointer: optProblem.Pointer,
+				}, pkt, true /* deliveredLocally */)
+				stats.MalformedPacketsReceived.Increment()
+			}
+			return nil, nil, false
+		}
+	}
+	// The packet is a fragment, let's try to reassemble it.
+	start := h.FragmentOffset()
+	// Drop the fragment if the size of the reassembled payload would exceed the
+	// maximum payload size.
+	//
+	// Note that this addition doesn't overflow even on 32bit architecture
+	// because pkt.Data().Size() should not exceed 65535 (the max IP datagram
+	// size). Otherwise the packet would've been rejected as invalid before
+	// reaching here.
+	if int(start)+pkt.Data().Size() > header.IPv4MaximumPayloadSize {
+		stats.MalformedPacketsReceived.Increment()
+		stats.MalformedFragmentsReceived.Increment()
+		return nil, nil, false
+	}
+
+	proto := h.Protocol()
+	resPkt, transProtoNum, ready, err := e.protocol.fragmentation.Process(
+		// As per RFC 791 section 2.3, the identification value is unique
+		// for a source-destination pair and protocol.
+		fragmentation.FragmentID{
+			Source:      h.SourceAddress(),
+			Destination: h.DestinationAddress(),
+			ID:          uint32(h.ID()),
+			Protocol:    proto,
+		},
+		start,
+		start+uint16(pkt.Data().Size())-1,
+		h.More(),
+		proto,
+		pkt,
+	)
+	if err != nil {
+		stats.MalformedPacketsReceived.Increment()
+		stats.MalformedFragmentsReceived.Increment()
+		return nil, nil, false
+	}
+	if !ready {
+		return nil, nil, false
+	}
+	h = header.IPv4(resPkt.NetworkHeader().View())
+
+	// The reassembler doesn't take care of fixing up the header, so we need
+	// to do it here.
+	h.SetTotalLength(uint16(resPkt.Data().Size() + len(h)))
+	h.SetFlagsFragmentOffset(0, 0)
+
+	e.protocol.parseTransport(resPkt, tcpip.TransportProtocolNumber(transProtoNum))
+
+	return resPkt, h, true
 }
 
 // handleLocalPacket is like HandlePacket except it does not perform the
@@ -804,18 +893,29 @@ func (e *endpoint) handleLocalPacket(pkt *stack.PacketBuffer, canSkipRXChecksum 
 		return
 	}
 
+	var reassembled bool
+	pkt, h, reassembled = e.reassemble(pkt, h)
+	if pkt == nil {
+		return
+	}
+	if reassembled {
+		defer pkt.DecRef()
+	}
+
 	e.handleValidatedPacket(h, pkt, e.nic.Name() /* inNICName */)
 }
 
 func (e *endpoint) handleValidatedPacket(h header.IPv4, pkt *stack.PacketBuffer, inNICName string) {
 	pkt.NICID = e.nic.ID()
 
+	if h.More() || h.FragmentOffset() != 0 {
+		panic(fmt.Sprintf("packets must already be reassembled: got h.More() = %t, h.FragmentOffset() = %d", h.More(), h.FragmentOffset()))
+	}
+
 	// Raw socket packets are delivered based solely on the transport protocol
 	// number. We only require that the packet be valid IPv4, and that they not
 	// be fragmented.
-	if !h.More() && h.FragmentOffset() == 0 {
-		e.dispatcher.DeliverRawPacket(h.TransportProtocol(), pkt)
-	}
+	e.dispatcher.DeliverRawPacket(h.TransportProtocol(), pkt)
 
 	stats := e.stats
 	stats.ip.ValidPacketsReceived.Increment()
@@ -883,81 +983,6 @@ func (e *endpoint) handleValidatedPacket(h header.IPv4, pkt *stack.PacketBuffer,
 		return
 	}
 
-	if h.More() || h.FragmentOffset() != 0 {
-		if pkt.Data().Size()+pkt.TransportHeader().View().Size() == 0 {
-			// Drop the packet as it's marked as a fragment but has
-			// no payload.
-			stats.ip.MalformedPacketsReceived.Increment()
-			stats.ip.MalformedFragmentsReceived.Increment()
-			return
-		}
-		if opts := h.Options(); len(opts) != 0 {
-			// If there are options we need to check them before we do assembly
-			// or we could be assembling errant packets. However we do not change the
-			// options as that could lead to double processing later.
-			if _, _, optProblem := e.processIPOptions(pkt, opts, &optionUsageVerify{}); optProblem != nil {
-				if optProblem.NeedICMP {
-					_ = e.protocol.returnError(&icmpReasonParamProblem{
-						pointer: optProblem.Pointer,
-					}, pkt, true /* deliveredLocally */)
-					e.stats.ip.MalformedPacketsReceived.Increment()
-				}
-				return
-			}
-		}
-		// The packet is a fragment, let's try to reassemble it.
-		start := h.FragmentOffset()
-		// Drop the fragment if the size of the reassembled payload would exceed the
-		// maximum payload size.
-		//
-		// Note that this addition doesn't overflow even on 32bit architecture
-		// because pkt.Data().Size() should not exceed 65535 (the max IP datagram
-		// size). Otherwise the packet would've been rejected as invalid before
-		// reaching here.
-		if int(start)+pkt.Data().Size() > header.IPv4MaximumPayloadSize {
-			stats.ip.MalformedPacketsReceived.Increment()
-			stats.ip.MalformedFragmentsReceived.Increment()
-			return
-		}
-
-		proto := h.Protocol()
-		resPkt, transProtoNum, ready, err := e.protocol.fragmentation.Process(
-			// As per RFC 791 section 2.3, the identification value is unique
-			// for a source-destination pair and protocol.
-			fragmentation.FragmentID{
-				Source:      h.SourceAddress(),
-				Destination: h.DestinationAddress(),
-				ID:          uint32(h.ID()),
-				Protocol:    proto,
-			},
-			start,
-			start+uint16(pkt.Data().Size())-1,
-			h.More(),
-			proto,
-			pkt,
-		)
-		if err != nil {
-			stats.ip.MalformedPacketsReceived.Increment()
-			stats.ip.MalformedFragmentsReceived.Increment()
-			return
-		}
-		if !ready {
-			return
-		}
-		defer resPkt.DecRef()
-		pkt = resPkt
-		h = header.IPv4(pkt.NetworkHeader().View())
-
-		// The reassembler doesn't take care of fixing up the header, so we need
-		// to do it here.
-		h.SetTotalLength(uint16(pkt.Data().Size() + len(h)))
-		h.SetFlagsFragmentOffset(0, 0)
-
-		e.protocol.parseTransport(pkt, tcpip.TransportProtocolNumber(transProtoNum))
-
-		// Now that the packet is reassembled, it can be sent to raw sockets.
-		e.dispatcher.DeliverRawPacket(h.TransportProtocol(), pkt)
-	}
 	stats.ip.PacketsDelivered.Increment()
 
 	p := h.TransportProtocol()
