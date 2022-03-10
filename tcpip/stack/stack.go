@@ -1131,6 +1131,13 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 		s.route.mu.RLock()
 		defer s.route.mu.RUnlock()
 
+		// We want to find the route that has the longest prefix length,
+		// so that more specific routes will win.
+		// TODO: Probably should have additional tie-breaks here so that
+		// the result is always deterministic.
+		var bestPrefixLen int
+		var bestRoute *Route
+
 		for _, route := range s.route.mu.table {
 			if len(remoteAddr) != 0 && !route.Destination.Contains(remoteAddr) {
 				continue
@@ -1141,17 +1148,32 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 				continue
 			}
 
+			plen := route.Destination.Mask().Prefix()
+			if plen <= bestPrefixLen {
+				continue
+			}
+
 			if id == 0 || id == route.NIC {
 				if addressEndpoint := s.getAddressEP(nic, localAddr, remoteAddr, netProto); addressEndpoint != nil {
 					var gateway tcpip.Address
 					if needRoute {
 						gateway = route.Gateway
 					}
-					r := constructAndValidateRoute(netProto, addressEndpoint, nic /* outgoingNIC */, nic /* outgoingNIC */, gateway, localAddr, remoteAddr, s.handleLocal, multicastLoop)
-					if r == nil {
+
+					if r := constructAndValidateRoute(netProto, addressEndpoint, nic /* outgoingNIC */, nic /* outgoingNIC */, gateway, localAddr, remoteAddr, s.handleLocal, multicastLoop); r == nil {
 						panic(fmt.Sprintf("non-forwarding route validation failed with route table entry = %#v, id = %d, localAddr = %s, remoteAddr = %s", route, id, localAddr, remoteAddr))
+					} else if plen > bestPrefixLen {
+						bestRoute, bestPrefixLen = r, plen
 					}
-					return r
+				} else {
+					// There's no local address on the NIC but this route suggests that
+					// we can still reach this destination address via this NIC, so just
+					// construct a route that uses the remote address as the gateway.
+					if r := constructAndValidateRoute(netProto, nil, nic /* outgoingNIC */, nic /* outgoingNIC */, remoteAddr, localAddr, remoteAddr, s.handleLocal, multicastLoop); r == nil {
+						panic(fmt.Sprintf("non-forwarding route validation failed with route table entry = %#v, id = %d, localAddr = %s, remoteAddr = %s", route, id, localAddr, remoteAddr))
+					} else if plen > bestPrefixLen {
+						bestRoute, bestPrefixLen = r, plen
+					}
 				}
 			}
 
@@ -1167,7 +1189,7 @@ func (s *Stack) FindRoute(id tcpip.NICID, localAddr, remoteAddr tcpip.Address, n
 			}
 		}
 
-		return nil
+		return bestRoute // might be nil
 	}(); r != nil {
 		return r, nil
 	}
